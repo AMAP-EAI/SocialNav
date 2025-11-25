@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="description"
+    content="SocialNav: A Foundational Model for Socially-Aware Navigation.">
+  <meta name="keywords" content="SocialNav, Embodied AI, Navigation, Social Norms, Robotics">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SocialNav: A Foundational Model for Socially-Aware Navigation</title>
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
+  <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="./static/js/fontawesome.all.min.js"></script>
+  <script src="./static/js/bulma-carousel.min.js"></script>
+  <script src="./static/js/bulma-slider.min.js"></script>
+  <script src="./static/js/index.js"></script>
+</head>
+
+<body>
+
+  <section class="hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered">
+          <div class="column has-text-centered">
+            <h1 class="title is-1 publication-title">SocialNav: A Foundational Model for Socially-Aware Navigation</h1>
+            <div class="is-size-5 publication-authors">
+              <span class="author-block">
+                <!-- TODO: 请在这里替换为真实作者和链接 -->
+                <a href="[作者A的主页链接]">作者A</a><sup>*</sup>,</span>
+              <span class="author-block">
+                <a href="[作者B的主页链接]">作者B</a><sup>*</sup>,</span>
+              <span class="author-block">
+                <a href="[作者C的主页链接]">作者C</a>
+              </span>
+            </div>
+
+            <div class="is-size-5 publication-authors">
+              <span class="author-block">AMAP-EAI Lab</span>
+              <span class="author-block"><sup>*</sup>Equal Contribution</span>
+            </div>
+
+            <div class="column has-text-centered">
+              <div class="publication-links">
+                <!-- PDF Link -->
+                <span class="link-block">
+                  <a href="[你的论文PDF或arXiv链接]"
+                    class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">
+                      <i class="fas fa-file-pdf"></i>
+                    </span>
+                    <span>Paper</span>
+                  </a>
+                </span>
+                <!-- arXiv Link -->
+                <span class="link-block">
+                  <a href="[你的arXiv链接]" class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">
+                      <i class="ai ai-arxiv"></i>
+                    </span>
+                    <span>arXiv</span>
+                  </a>
+                </span>
+                <!-- Code Link -->
+                <span class="link-block">
+                  <a href="https://github.com/AMAP-EAI/SocialNav"
+                    class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">
+                      <i class="fab fa-github"></i>
+                    </span>
+                    <span>Code</span>
+                  </a>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Teaser Video -->
+  <section class="hero teaser">
+    <div class="container is-max-desktop">
+      <div class="hero-body">
+        <!-- poster属性是视频加载时的封面图 -->
+        <video id="teaser" autoplay muted loop playsinline poster="images/teaser_fallback.jpg">
+          <source src="images/teaser.mp4" type="video/mp4">
+        </video>
+        <h2 class="subtitle has-text-centered">
+          SocialNav combines high-level semantic reasoning with low-level trajectory generation. It identifies socially traversable zones and generates CoT explanations, planning routes that respect social norms.
+        </h2>
+      </div>
+    </div>
+  </section>
+  <!-- End Teaser Video -->
+
+  <!-- Paper Abstract -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h2 class="title is-3">Abstract</h2>
+          <div class="content has-text-justified">
+            <p>
+              Embodied navigation that adheres to social norms remains an open research challenge. Our <strong>SocialNav</strong> is a foundational model for socially-aware navigation with a hierarchical "brain-action" architecture, capable of understanding high-level social norms and generating low-level, socially compliant trajectories. To enable such dual capabilities, we construct the SocNav Dataset, a large-scale collection of 7 million samples, comprising (1) a Cognitive Activation Dataset providing social reasoning signals such as chain-of-thought explanations and social traversability prediction, and (2) an Expert Trajectories Pyramid aggregating diverse navigation demonstrations from internet videos, simulated environments, and real-world robots. A multi-stage training pipeline is proposed to gradually inject and refine navigation intelligence: we first inject general navigation skills and social norms understanding into the model via imitation learning, and then refine such skills through a deliberately designed Socially-Aware Flow Exploration GRPO (SAFE-GRPO), the first flow-based reinforcement learning framework for embodied navigation that explicitly rewards socially compliant behaviors. SocialNav achieves +38% success rate and +46% social compliance rate compared to the state-of-the-art method, demonstrating strong gains in both navigation performance and social compliance.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <!-- End Abstract -->
+
+  <!-- Method -->
+  <section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <div class="column is-four-fifths">
+                <h2 class="title is-3">Method</h2>
+                <div class="content">
+                    <img src="images/method.jpg" alt="SocialNav Architecture and Training Pipeline"/>
+                    <p>
+                        SocialNav adopts a hierarchical "brain-action" architecture, with a VLM-based Brain for high-level semantic reasoning and an action expert for generating socially compliant trajectories. We adopt a three-stage training strategy: Pre-training, Fine-tuning, and SAFE-GRPO.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+  </section>
+  <!-- End Method -->
+
+  <!-- Dataset -->
+  <section class="section">
+      <div class="container is-max-desktop">
+          <div class="columns is-centered has-text-centered">
+              <div class="column is-four-fifths">
+                  <h2 class="title is-3">SocNav Dataset and Benchmark</h2>
+                  <div class="content">
+                      <img src="images/dataset.jpg" alt="Overview of the SocNav Dataset and Benchmark"/>
+                      <p>
+                          The SocNav Dataset illustrates the hierarchical structure and data construction pipeline, composed of the Expert Trajectories Pyramid (ETP) and Cognitive Activation Dataset (CAD). The SocNav Benchmark is a high-fidelity evaluation platform for comprehensive assessment of socially-aware navigation.
+                      </p>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </section>
+  <!-- End Dataset -->
+  
+  <!-- Qualitative Results -->
+  <section class="section">
+      <div class="container is-max-desktop">
+          <div class="columns is-centered has-text-centered">
+              <div class="column is-four-fifths">
+                  <h2 class="title is-3">Qualitative Results</h2>
+                  <div class="content">
+                      <img src="images/qualitative_vis.jpg" alt="Qualitative comparison on the SocNav Benchmark"/>
+                      <p>
+                          Qualitative comparison in three scenes (Crossing, Park, Campus). Our method (green) consistently adheres to social norms like sidewalks, while the baseline (red) often takes socially risky shortcuts.
+                      </p>
+                  </div>
+              </div>
+          </div>
+      </div>
+  </section>
+  <!-- End Qualitative Results -->
+  
+  <!-- BibTex -->
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <h2 class="title">BibTeX</h2>
+      <pre><code>@inproceedings{SocialNav2024,
+  title     = {SocialNav: A Foundational Model for Socially-Aware Navigation},
+  author    = {[作者A and 作者B and 作者C]},
+  booktitle = {[Conference Name]},
+  year      = {2024},
+  url       = {https://github.com/AMAP-EAI/SocialNav}
+}</code></pre>
+    </div>
+  </section>
+  <!-- End BibTex -->
+
+  <footer class="footer">
+    <div class="container">
+      <div class="content has-text-centered">
+        <a class="icon-link" href="[你的论文PDF或arXiv链接]">
+          <i class="fas fa-file-pdf"></i>
+        </a>
+        <a class="icon-link" href="https://github.com/AMAP-EAI/SocialNav" class="external-link" disabled>
+          <i class="fab fa-github"></i>
+        </a>
+      </div>
+      <div class="columns is-centered">
+        <div class="column is-8">
+          <div class="content">
+            <p>
+              This website is licensed under a <a rel="license"
+                href="http://creativecommons.org/licenses/by-sa/4.0/">Creative
+                Commons Attribution-ShareAlike 4.0 International License</a>.
+            </p>
+            <p>
+              This page was built using the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template">Academic Project Page Template</a>.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+</body>
+
+</html>
+
