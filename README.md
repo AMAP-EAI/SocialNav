@@ -64,10 +64,9 @@ If you are interested, please **watch** or **star** this repository to get notif
 If you find this project useful in your research, please consider citing:
 
 ```bibtex
-@inproceedings{SocialNav2024,
-  title     = {SocialNav: A Foundational Model for Socially-Aware Navigation},
-  author    = {TODO: Fill in author list},
-  booktitle = {TODO: Conference / Journal},
-  year      = {2024},
-  url       = {https://github.com/AMAP-EAI/SocialNav}
+@article{chen2025socialnav,
+      title={SocialNav: Training Human-Inspired Foundation Model for Socially-Aware Embodied Navigation}, 
+      author={Ziyi Chen and Yingnan Guo and Zedong Chu and Minghua Luo and Yanfen Shen and Mingchao Sun and Junjun Hu and Shichao Xie and Kuan Yang and Pei Shi and Zhining Gu and Lu Liu and Honglin Han and Xiaolong Wu and Mu Xu and Yu Zhang},
+      journal={arXiv preprint arXiv:2511.21135},
+      year={2025}
 }
