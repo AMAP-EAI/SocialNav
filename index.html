@@ -101,6 +101,12 @@
                     <span>Code</span>
                   </a>
                 </span>
+                <!-- Data Button (Gray) -->
+                <span class="link-block">
+                  <button class="button is-normal is-rounded is-light" disabled>
+                    Data
+                  </button>
+                </span>
               </div>
             </div>
           </div>
@@ -113,10 +119,12 @@
   <section class="hero teaser">
     <div class="container is-max-desktop">
       <div class="hero-body">
-        <!-- poster属性是视频加载时的封面图 -->
-        <video id="teaser" autoplay muted loop playsinline poster="images/teaser_fallback.jpg">
-          <source src="images/teaser.mp4" type="video/mp4">
-        </video>
+        <!-- video container centered -->
+        <div class="has-text-centered">
+          <video controls autoplay style="max-width: 100%; height: auto;">
+            <source src="images/teaser.mp4" type="video/mp4">
+          </video>
+        </div>
         <h2 class="subtitle has-text-centered">
           SocialNav combines high-level semantic reasoning with low-level trajectory generation. It identifies socially traversable zones and generates CoT explanations, planning routes that respect social norms.
         </h2>
@@ -124,6 +132,7 @@
     </div>
   </section>
   <!-- End Teaser Video -->
+  
 
   <!-- Paper Abstract -->
   <section class="section">
@@ -150,7 +159,7 @@
               <div class="column is-four-fifths">
                   <h2 class="title is-3">Socially-Aware Navigation in Real-World Environments.</h2>
                   <div class="content">
-                      <img src="images/dataset.jpg" alt="Overview of the SocNav Dataset and Benchmark"/>
+                      <img src="images/first.jpg" alt="Overview of the SocNav Dataset and Benchmark"/>
                       <p>
                           SocialNav combines high-level semantic reasoning with low-level trajectory generation. It identifies socially traversable zones and generates CoT explanations, planning routes that respect social norms.
                       </p>
