@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [    
+    
+    {
+      "name": "Debug Qwen-VL SFT (single GPU, no deepspeed)",
+      "type": "python",
+      "request": "launch",
+      "python": "/mnt/nas-data-3/jiexing.gyn/envs/train/bin/python",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/src/train/train_sft.py",
+      "args": [
+        "--use_liger_kernel", "False",
+        "--model_id", "/mnt/nas-data-3/jiexing.gyn/Qwen3-VL-4B-Instruct",
+        "--data_path", "/mnt/nas-data-3/jiexing.gyn/Data/debug/debug.jsonl",
+        "--image_folder", "/",
+        "--remove_unused_columns", "False",
+        "--freeze_vision_tower", "True",
+        "--freeze_llm", "True"
+        "--freeze_merger", "True",
+        "--bf16", "True",
+        "--fp16", "False",
+        "--tf32", "True",
+        "--disable_flash_attn2", "False", 
+        "--gradient_checkpointing", "True",
+
+        "--output_dir", "/mnt/nas-data-3/jiexing.gyn/training_result/",
+        "--num_train_epochs", "500",
+
+        // 尽量模拟正式配置：单卡时 4 * 4 = 全局 16
+        "--per_device_train_batch_size", "1",
+        "--gradient_accumulation_steps", "1",
+        "--learning_rate", "1e-4",
+        "--vision_lr", "1e-4",
+        "--merger_lr", "1e-4",
+        "--weight_decay", "0.1",
+        "--warmup_ratio", "0.03",
+        "--lr_scheduler_type", "constant",
+        "--logging_steps", "1",
+        "--save_strategy", "steps",
+        "--save_steps", "500",
+        "--save_total_limit", "10",
+        "--dataloader_num_workers", "4",
+        "--lazy_preprocess", "True",
+        "--image_min_pixels", "524288",                      // 512 * 32 * 32
+        "--image_max_pixels", "1310720",                     // 1280 * 32 * 32
+        "--report_to", "tensorboard"                   
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "1",
+        "PYTHONPATH": "${workspaceFolder}:${workspaceFolder}/src"
+      },
+      "justMyCode": false,
+      "console": "integratedTerminal"
+    }
+  ]
+}
