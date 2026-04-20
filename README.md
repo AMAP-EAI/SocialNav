@@ -3,7 +3,7 @@
 <div align="center" style="margin: 1rem 0 1.1rem;">
 
 <p align="center" style="margin: 0; font-size: clamp(1.2rem, 2.6vw, 1.65rem); font-weight: 700; letter-spacing: 0.06em; line-height: 1.35; color: #006BB6; font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
-  <strong>🎉🎉CVPR 2026🎉🎉</strong>
+  <strong>🎉🎉CVPR 2026 Oral🎉🎉</strong>
 </p>
 
 </div>
