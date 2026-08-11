@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import argparse
 import os
 import jsonlines
 from tqdm import tqdm
@@ -9,36 +10,39 @@ import torch.nn.functional as F
 import pandas as pd
 import time
 from PIL import Image
-from safetensors.torch import load_file
 
-from transformers import AutoProcessor
-
-MODEL_PATH = "/mnt/nas-data-3/jiexing.gyn/ckpts/checkpoint-28500"
-DATA_PATH = "/mnt/nas-data-3/jiexing.gyn/Data/debug/1031_teleop_range1_interval1_new.jsonl"
-
-DEVICE = "cuda:0"
-
-OUTPUT_DIR = os.path.join(MODEL_PATH, "infer_result_citywalker_qwen3_fast_step_5")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-PRED_JSONL_PATH = os.path.join(OUTPUT_DIR, "pred_citywalker_qwen3.jsonl")
-METRIC_CSV_PATH = os.path.join(OUTPUT_DIR, "metrics_citywalker_qwen3.csv")
+from transformers import AutoConfig, AutoProcessor
 
 TEST_CATEGORIES = ['crowd', 'person_close_by', 'turn', 'action_target_mismatch', 'crossing', 'other']
 
-def init_metric_dict():
+# The waypoint placeholders are contiguous in the tokenizer: <input_pos1>..<input_pos5>
+# followed by <input_target>. Their absolute ids differ per backbone, so they are
+# always resolved from the tokenizer rather than hard-coded.
+WAYPOINT_TOKENS = [f"<input_pos{i}>" for i in range(1, 6)] + ["<input_target>"]
+EXTRA_SPECIAL_TOKENS = ["<flow_matching_policy>", "<time>"]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="CityWalker benchmark evaluation for SocialNav (Qwen2-VL / Qwen2.5-VL / Qwen3-VL)."
+    )
+    p.add_argument("--model-path", required=True, help="Path to a SocialNav checkpoint directory.")
+    p.add_argument("--data-path", required=True, help="Benchmark .jsonl file.")
+    p.add_argument("--output-dir", default=None, help="Defaults to <model-path>/infer_result_citywalker.")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--flow-steps", type=int, default=5, help="Euler steps used by the action expert.")
+    p.add_argument("--limit", type=int, default=None, help="Only evaluate the first N samples.")
+    return p.parse_args()
+
+
+def init_metric_dict(action_chunk):
     metrics = {}
     cats = TEST_CATEGORIES[:] + ["mean", "overall"]
     for c in cats:
-        metrics[c] = {
-            "l1_loss": [],
-            "arrived_accuracy": [],
-            "angle_step1": [],
-            "angle_step2": [],
-            "angle_step3": [],
-            "angle_step4": [],
-            "angle_step5": [],
-            "mean_angle": [],
-        }
+        metrics[c] = {"l1_loss": [], "arrived_accuracy": []}
+        for i in range(1, action_chunk + 1):
+            metrics[c][f"angle_step{i}"] = []
+        metrics[c]["mean_angle"] = []
     return metrics
 
 def compute_sample_metrics(pred_wp_abs, gt_wp_abs, pred_arrive_logit, gt_arrive):
@@ -47,9 +51,14 @@ def compute_sample_metrics(pred_wp_abs, gt_wp_abs, pred_arrive_logit, gt_arrive)
     l1_like = F.mse_loss(pred_t, gt_t, reduction="none").sqrt()
     max_l1_like = float(l1_like.view(-1).max().item())
 
-    pred_prob = torch.sigmoid(torch.tensor(pred_arrive_logit))
-    pred_label = 1.0 if float(pred_prob) >= 0.5 else 0.0
-    arrived_correct = 1.0 if int(pred_label) == int(gt_arrive[0]) else 0.0
+    # The released checkpoints have no arrival head, so `pred_arrive_logit` is None
+    # and the accuracy is reported as NaN rather than as a meaningless constant.
+    if pred_arrive_logit is None:
+        arrived_correct = float("nan")
+    else:
+        pred_prob = torch.sigmoid(torch.tensor(pred_arrive_logit))
+        pred_label = 1.0 if float(pred_prob) >= 0.5 else 0.0
+        arrived_correct = 1.0 if int(pred_label) == int(gt_arrive[0]) else 0.0
 
     pred_flat = pred_t.view(-1, 2)
     gt_flat = gt_t.view(-1, 2)
@@ -59,24 +68,43 @@ def compute_sample_metrics(pred_wp_abs, gt_wp_abs, pred_arrive_logit, gt_arrive)
     max_angle_deg = float(angles.max().item())
     return max_l1_like, arrived_correct, angles_np, max_angle_deg
 
-SPECIAL_TOKEN2ID = {
-    '<input_pos1>': 151657,
-    '<input_pos2>': 151658,
-    '<input_pos3>': 151659,
-    '<input_pos4>': 151660,
-    '<input_pos5>': 151661,
-    '<input_target>': 151662,
-    '<flow_matching_policy>': 151664,
-    '<time>': 151665,
+
+# model_type -> (model class name, monkey patch helpers)
+BACKBONES = {
+    "qwen2_vl": ("Qwen2VLForConditionalGeneration", ["replace_qwen_2_with_mixed_modality_forward"]),
+    "qwen2_5_vl": (
+        "Qwen2_5_VLForConditionalGeneration",
+        ["replace_qwen2_5_with_mixed_modality_forward", "replace_qwen2_5_vision"],
+    ),
+    "qwen3_vl": ("Qwen3VLForConditionalGeneration", ["replace_qwen3_with_mixed_modality_forward"]),
+    "qwen3_vl_moe": ("Qwen3VLMoeForConditionalGeneration", ["replace_qwen3_vl_moe_with_mixed_modality_forward"]),
 }
 
-class Qwen3VLModel(object):
+
+class SocialNavModel(object):
+    """Loads a SocialNav checkpoint on any of the supported Qwen-VL backbones."""
+
     def __init__(self, model_path, device="cuda:0", flow_steps=5):
+        import transformers
+
+        from src.train import monkey_patch_forward, monkey_patch_vision
+
         self.device = torch.device(device)
 
-        from transformers import Qwen3VLForConditionalGeneration
+        config = AutoConfig.from_pretrained(model_path)
+        self.model_type = config.model_type
+        if self.model_type not in BACKBONES:
+            raise ValueError(
+                f"Unsupported model_type '{self.model_type}'. Expected one of: {', '.join(BACKBONES)}."
+            )
+        class_name, patches = BACKBONES[self.model_type]
 
-        dtype = torch.bfloat16
+        # Apply the same mixed-modality patches the training entrypoints use, so
+        # that evaluation and training run the exact same backbone code path.
+        for patch in patches:
+            fn = getattr(monkey_patch_forward, patch, None) or getattr(monkey_patch_vision, patch)
+            fn()
+
         additional_model_kwargs = {
             "action_dim": 2,
             "action_chunk": 5,
@@ -85,25 +113,47 @@ class Qwen3VLModel(object):
             "action_former": True,
             "query_action_layer": 4,
             "sigma": 0.0,
+            "ar_lambda_loss": 1.0,
+            "min_value": -1.25,
+            "max_value": 1.25,
             "sde_mode": "cps",
         }
 
-        print(f">>> 加载 Qwen3VL 模型：{model_path}")
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        print(f">>> loading {class_name} from {model_path}")
+        model_cls = getattr(transformers, class_name)
+        # `from_pretrained` already remaps the checkpoint layout and loads the
+        # action expert, so no manual state_dict reload is needed.
+        self.model = model_cls.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=torch.bfloat16,
             device_map=str(device),
-            trust_remote_code=True,
             **additional_model_kwargs,
         )
-        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        self.model = self.model.cuda()
-        for name in os.listdir(model_path):
-            if name.endswith('safetensors'):
-                safe_model_path = os.path.join(model_path, name)
-                state_dict = load_file(safe_model_path)
-                self.model.load_state_dict(state_dict, strict=False)
         self.model.eval()
+
+        self.processor = AutoProcessor.from_pretrained(model_path)
+        self.special_token2id = self._resolve_special_tokens()
+        self.action_chunk = self.model.action_chunk
+        print(f">>> backbone={self.model_type} action_chunk={self.action_chunk} flow_steps={flow_steps}")
+        print(f">>> <input_pos1> resolved to id {self.special_token2id['<input_pos1>']}")
+
+    def _resolve_special_tokens(self):
+        """Resolve the SocialNav placeholder ids from the checkpoint's tokenizer."""
+        tokenizer = self.processor.tokenizer
+        token2id = {}
+        for token in WAYPOINT_TOKENS + EXTRA_SPECIAL_TOKENS:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is None or token_id == tokenizer.unk_token_id:
+                raise ValueError(
+                    f"Token {token} is missing from the tokenizer of this checkpoint; "
+                    "it is required to inject the history waypoints."
+                )
+            token2id[token] = token_id
+
+        ids = [token2id[t] for t in WAYPOINT_TOKENS]
+        if ids != list(range(ids[0], ids[0] + len(ids))):
+            raise ValueError(f"Waypoint placeholder ids must be contiguous, got {ids}.")
+        return token2id
 
     @torch.no_grad()
     def infer_one(self, item):
@@ -131,7 +181,7 @@ class Qwen3VLModel(object):
         ).to(self.device)
 
         input_waypoints = torch.tensor(
-            messages[1]["input_waypoints"], dtype=torch.bfloat16
+            messages[1]["input_waypoints"], dtype=torch.float32
         ).unsqueeze(0).to(self.device)
         inputs["input_waypoints"] = input_waypoints
 
@@ -140,45 +190,47 @@ class Qwen3VLModel(object):
             train=False,
             train_branch="fm",
             num_samples=1,
-            special_token2id=SPECIAL_TOKEN2ID,
+            special_token2id=self.special_token2id,
         )
 
-        if isinstance(outputs, tuple):
-            wp_pred = outputs[0]
-            arrive_pred = outputs[1] if len(outputs) > 1 else None
-        else:
-            wp_pred = outputs
-            arrive_pred = None
+        wp_pred, arrive_pred = outputs[0], outputs[1] if len(outputs) > 1 else None
+        wp_pred = wp_pred.squeeze(0).detach().cpu().float().numpy()
 
-        if isinstance(wp_pred, torch.Tensor):
-            wp_pred = wp_pred.squeeze(0).detach().cpu().float().numpy()
-        else:
-            wp_pred = np.array(wp_pred, dtype=np.float32)
-
-        if isinstance(arrive_pred, torch.Tensor):
+        # `arrive` is a placeholder in the released checkpoints (no arrival head):
+        # keep it as None so the metric is reported as NaN instead of a constant.
+        arrive_logit = None
+        if isinstance(arrive_pred, torch.Tensor) and arrive_pred.abs().sum() > 0:
             arrive_logit = float(arrive_pred.squeeze().detach().cpu().float().item())
-        elif isinstance(arrive_pred, (bool, int, float)):
-            arrive_logit = 10.0 if bool(arrive_pred) else -10.0
-        else:
-            arrive_logit = -10.0
 
         return wp_pred, arrive_logit
 
 def main():
-    print("===> [1/4] 加载模型:", MODEL_PATH)
-    model = Qwen3VLModel(MODEL_PATH, device=DEVICE, flow_steps=5)
+    args = parse_args()
+    model_path = args.model_path
+    output_dir = args.output_dir or os.path.join(model_path, "infer_result_citywalker")
+    os.makedirs(output_dir, exist_ok=True)
 
-    print("===> [2/4] 加载测试数据:", DATA_PATH)
+    print("===> [1/4] loading model:", model_path)
+    model = SocialNavModel(model_path, device=args.device, flow_steps=args.flow_steps)
+    action_chunk = model.action_chunk
+    angle_keys = [f"angle_step{i}" for i in range(1, action_chunk + 1)]
+
+    pred_jsonl_path = os.path.join(output_dir, f"pred_citywalker_{model.model_type}.jsonl")
+    metric_csv_path = os.path.join(output_dir, f"metrics_citywalker_{model.model_type}.csv")
+
+    print("===> [2/4] loading benchmark data:", args.data_path)
     data_lines = []
-    with jsonlines.open(DATA_PATH, "r") as reader:
+    with jsonlines.open(args.data_path, "r") as reader:
         for obj in reader:
             data_lines.append(obj)
+    if args.limit is not None:
+        data_lines = data_lines[: args.limit]
     total = len(data_lines)
-    print(f"===> 一共 {total} 条样本")
+    print(f"===> {total} samples")
 
-    print("===> [3/4] 推理 + 指标统计（无可视化） ...")
-    metrics = init_metric_dict()
-    wf = jsonlines.open(PRED_JSONL_PATH, mode="w")
+    print("===> [3/4] inference + metrics ...")
+    metrics = init_metric_dict(action_chunk)
+    wf = jsonlines.open(pred_jsonl_path, mode="w")
 
     success = 0
     filtered_count = 0
@@ -187,7 +239,7 @@ def main():
     progress_bar = tqdm(
         enumerate(data_lines),
         total=total,
-        desc="推理进度",
+        desc="inference",
         dynamic_ncols=True,
         mininterval=0.3,
         smoothing=0.0,
@@ -201,8 +253,8 @@ def main():
             t1 = time.time()
 
             msg1 = item["messages"][1]
-            gt_waypoints = np.asarray(msg1["gt_waypoints"], dtype=np.float32)[:5]
-            wp_pred_rel = wp_pred_rel[:5]
+            gt_waypoints = np.asarray(msg1["gt_waypoints"], dtype=np.float32)[:action_chunk]
+            wp_pred_rel = wp_pred_rel[:action_chunk]
 
             step_scale = float(msg1["step_scale"])
             gt_arrive = msg1.get("arrive", [0.0])
@@ -234,9 +286,7 @@ def main():
                 m["l1_loss"].append(l1_val)
                 m["arrived_accuracy"].append(acc_val)
                 m["mean_angle"].append(max_angle)
-                for i, k in enumerate(
-                    ["angle_step1", "angle_step2", "angle_step3", "angle_step4", "angle_step5"]
-                ):
+                for i, k in enumerate(angle_keys):
                     m[k].append(float(angles[i]))
 
                 for ci, cname in enumerate(TEST_CATEGORIES):
@@ -245,9 +295,7 @@ def main():
                         mc["l1_loss"].append(l1_val)
                         mc["arrived_accuracy"].append(acc_val)
                         mc["mean_angle"].append(max_angle)
-                        for i, k in enumerate(
-                            ["angle_step1", "angle_step2", "angle_step3", "angle_step4", "angle_step5"]
-                        ):
+                        for i, k in enumerate(angle_keys):
                             mc[k].append(float(angles[i]))
 
             wf.write({
@@ -272,19 +320,18 @@ def main():
             progress_bar.set_postfix({
                 "dist": f"{path_distance_m:.2f}m",
                 "angle": f"{max_angle:.2f}°",
-                "arr": int(acc_val),
                 "t(s)": f"{t1 - t0:.2f}",
             })
 
         except Exception as e:
-            print(f"[WARN] 第 {idx} 条推理失败: {e}")
+            print(f"[WARN] sample {idx} failed: {e}")
             continue
 
     wf.close()
     total_time = time.time() - start_time
 
-    print(f"\n===> [4/4] 完成。总用时 {total_time/60:.1f} 分钟，共处理 {success}/{total} 条样本。")
-    print(f"有效样本(参与指标 mean_angle 等)：{len(metrics['overall']['mean_angle'])}，被过滤：{filtered_count}")
+    print(f"\n===> [4/4] done in {total_time/60:.1f} min, {success}/{total} samples processed.")
+    print(f"kept for metrics: {len(metrics['overall']['mean_angle'])}, filtered out: {filtered_count}")
 
     for cname in TEST_CATEGORIES:
         metrics[cname]["count"] = len(metrics[cname]["l1_loss"])
@@ -304,11 +351,7 @@ def main():
         arr = np.asarray(v, dtype=np.float32)
         metrics["overall"][k] = float(np.nanmean(arr)) if arr.size > 0 else float("nan")
 
-    metric_names = [
-        "l1_loss", "arrived_accuracy",
-        "angle_step1", "angle_step2", "angle_step3", "angle_step4", "angle_step5",
-        "mean_angle",
-    ]
+    metric_names = ["l1_loss", "arrived_accuracy"] + angle_keys + ["mean_angle"]
     for mk in metric_names:
         vals = [metrics[c][mk] for c in TEST_CATEGORIES]
         metrics["mean"][mk] = (
@@ -316,10 +359,15 @@ def main():
         )
 
     df = pd.DataFrame(metrics).reset_index().rename(columns={"index": "Metrics"})
-    df.to_csv(METRIC_CSV_PATH, index=False)
+    df.to_csv(metric_csv_path, index=False)
 
-    print(f"指标CSV: {METRIC_CSV_PATH}")
-    print(f"逐条结果: {PRED_JSONL_PATH}")
+    print(f"metrics CSV: {metric_csv_path}")
+    print(f"per-sample results: {pred_jsonl_path}")
+    if np.isnan(metrics["overall"]["arrived_accuracy"]):
+        print(
+            "note: `arrived_accuracy` is NaN because the released checkpoints have no "
+            "arrival head; the action expert only predicts the trajectory."
+        )
 
 if __name__ == "__main__":
     main()

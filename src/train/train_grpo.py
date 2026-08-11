@@ -312,7 +312,8 @@ def train():
             model_args.model_id,
             dtype=compute_dtype,
             attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
+            **bnb_model_from_pretrained_args,
+            **additional_model_kwargs
         )
         
     else:
@@ -321,7 +322,8 @@ def train():
             model_args.model_id,
             dtype=compute_dtype,
             attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
+            **bnb_model_from_pretrained_args,
+            **additional_model_kwargs
         )
 
 

@@ -12,7 +12,10 @@
 
 This is the official repository for **SocialNav**, a foundational model for socially-aware embodied navigation with a hierarchical *brain–action* architecture. SocialNav unifies high-level social norm understanding with low-level, socially compliant trajectory generation.
 
-> 📢 **Note:** **Pre-trained models** (Hugging Face) and the **CityWalker benchmark evaluation script** are available in this repository.
+> 📢 **Note:** This repository contains the **model implementation**, the **training
+> entrypoints** and the **CityWalker benchmark evaluation script**. Pre-trained
+> SAFE-GRPO checkpoints are on ModelScope and Hugging Face; the upgraded SocNav
+> benchmark lives in [ABot-Navigation](https://github.com/amap-cvlab/ABot-Navigation).
 
 ---
 
@@ -53,7 +56,18 @@ SAFE-GRPO checkpoints:
 |----------|------------|--------------|
 | **Qwen2-VL** | [SocialNav-Qwen2-VL-SAFE-GRPO](https://www.modelscope.cn/models/zjugyn/SocialNav-Qwen2-VL-SAFE-GRPO) | [SocialNav-Qwen2-VL-SAFE-GRPO](https://huggingface.co/zjuSekineko/SocialNav-Qwen2-VL-SAFE-GRPO) |
 | **Qwen2.5-VL** | [SocialNav-Qwen2.5-VL-SAFE-GRPO](https://www.modelscope.cn/models/zjugyn/SocialNav-Qwen2.5-VL-SAFE-GRPO) | [SocialNav-Qwen2.5-VL-SAFE-GRPO](https://huggingface.co/zjuSekineko/SocialNav-Qwen2.5-VL-SAFE-GRPO) |
-| **Qwen3-VL** | *Coming soon* | *Coming soon* |
+
+These two checkpoints are the supported path for reproducing the reported results.
+The Qwen3-VL model code is kept in the repository for reference only.
+
+---
+
+## 📂 Dataset & Benchmark
+
+- **SocNav training dataset:** due to data privacy considerations, we have no plans to
+  release it. We appreciate your understanding.
+- **SocNav benchmark:** comprehensively upgraded and released separately in
+  [ABot-Navigation](https://github.com/amap-cvlab/ABot-Navigation).
 
 ---
 
@@ -93,15 +107,15 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
-For flow-matching components, if missing from `requirements.txt`:
-
-```bash
-pip install torchcfm diffusers
-```
+This already covers the flow-matching stack (`torchcfm`, `diffusers`) and, via its
+first line, the editable install of the local `transformers/` tree described below.
 
 ### 5. Local Transformers (required)
 
-This repo ships a patched **Qwen3-VL + Flow Matching** tree under `transformers/`. Install in editable mode:
+This repo ships a patched **Flow Matching** tree under `transformers/`. The SocialNav
+action expert is wired into **Qwen2-VL** and **Qwen2.5-VL** (the two released
+backbones); a Qwen3-VL implementation is also present for reference. If you did not
+install `requirements.txt`, install it explicitly:
 
 ```bash
 pip install -e "./transformers[dev]"   # or: pip install -e ./transformers
@@ -109,44 +123,60 @@ pip install -e "./transformers[dev]"   # or: pip install -e ./transformers
 
 ### 6. `PYTHONPATH`
 
-If `modeling_qwen3_vl.py` imports `src.train.sde_with_logprob`, run from the repo root or set:
+`modeling_qwen3_vl.py` imports `src.train.sde_with_logprob` at module level, and
+`src/train/monkey_patch_forward.py` imports the Qwen3-VL module, so the repo root has
+to be importable even when only Qwen2-VL / Qwen2.5-VL are used. Run from the repo
+root or set:
 
 ```bash
 export PYTHONPATH="/path/to/SocialNav:${PYTHONPATH}"
 ```
 
+For the same reason `diffusers` is a hard requirement, not an optional one. The
+Qwen2-VL / Qwen2.5-VL files themselves import the SAFE-GRPO schedules lazily and only
+need them when `grpo_mode=True`.
+
 ### 7. Flash Attention (optional)
 
-Install `flash-attn-2` per Qwen3-VL docs if you need lower memory; otherwise PyTorch **SDPA** is fine.
+Install `flash-attn-2` per the Qwen2-VL / Qwen2.5-VL docs if you need lower memory; otherwise PyTorch **SDPA** is fine.
 
 ---
 
 ## 📊 Evaluation
 
-**Script:** `utils/citywalker.py`  
-**Primary metric:** **`mean_angle`** in `metrics_citywalker_qwen3.csv`. Per sample, the script takes the **maximum** over five steps of the angle (degrees) between predicted and GT waypoint vectors; `mean_angle` in the CSV is the **mean** of that value over included samples (by row: categories, `overall`, and `mean`). Implementation: `compute_sample_metrics` and the `mean_angle` lists in `main`.
+**Script:** `utils/citywalker.py` — works with either released backbone
+(**Qwen2-VL** / **Qwen2.5-VL**). The architecture is detected from the checkpoint's
+`config.json` and the `<input_pos*>` token ids are resolved from the checkpoint's
+tokenizer, so no code edits are needed to switch backbones.
+
+**Primary metric:** **`mean_angle`** in `metrics_citywalker_<model_type>.csv`. Per sample, the script takes the **maximum** over five steps of the angle (degrees) between predicted and GT waypoint vectors; `mean_angle` in the CSV is the **mean** of that value over included samples (by row: categories, `overall`, and `mean`). Implementation: `compute_sample_metrics` and the `mean_angle` lists in `main`.
 
 **Input** (jsonl, one record per line):
 
 | Field | Description |
 |-------|-------------|
 | `images` | List of local image paths |
-| `messages[0].content` | User text |
+| `messages[0].content` | User text, containing the `<input_pos1>`..`<input_pos5>` and `<input_target>` placeholders |
 | `messages[1].gt_waypoints` | `(5, 2)` |
-| `messages[1].input_waypoints` | `(6, 2)` |
+| `messages[1].input_waypoints` | `(6, 2)` — 5 history positions plus the goal |
 | `messages[1].step_scale` | `float` |
 | `messages[1].arrive` | `[0]` or `[1]` |
 | `messages[1].categories` | Aligned with `TEST_CATEGORIES` in the script |
 
-**Run:** Set `MODEL_PATH`, `DATA_PATH`, and `DEVICE` at the top of the script, then:
+**Run:**
 
 ```bash
 cd /path/to/SocialNav
 export PYTHONPATH="$(pwd):${PYTHONPATH}"
-CUDA_VISIBLE_DEVICES=0 python utils/citywalker.py
+CUDA_VISIBLE_DEVICES=0 python utils/citywalker.py \
+    --model-path /path/to/SocialNav-Qwen2-VL-SAFE-GRPO \
+    --data-path  /path/to/citywalker_test.jsonl \
+    --device cuda:0 \
+    --flow-steps 5
 ```
 
-**Outputs:** `pred_citywalker_qwen3.jsonl`, `metrics_citywalker_qwen3.csv` (default under `MODEL_PATH/infer_result_citywalker_qwen3_fast_step_5/`; see `OUTPUT_DIR` in the script).
+**Outputs:** `pred_citywalker_<model_type>.jsonl` and `metrics_citywalker_<model_type>.csv`,
+written to `--output-dir` (default `<model-path>/infer_result_citywalker/`).
 
 ---
 

@@ -24,12 +24,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# SocialNav: the flow-matching action expert draws its conditional flow-matching
+# schedule from `torchcfm`. It is an optional dependency, so that importing this
+# module never fails; only the flow-matching branch actually requires it.
+try:
+    from torchcfm.conditional_flow_matching import ConditionalFlowMatcher as _ConditionalFlowMatcherBase
+except ImportError:
+    _ConditionalFlowMatcherBase = None
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -1355,6 +1364,472 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.LongTensor] = None
 
 
+# =============================================================================
+# SocialNav: flow-matching action expert
+#
+# The modules below implement the low-level "action expert" that turns the
+# hidden states of the VLM brain into a socially compliant trajectory. They are
+# shared verbatim across the Qwen2-VL / Qwen2.5-VL / Qwen3-VL backbones so that
+# a checkpoint trained on one backbone keeps the exact same parameter names.
+# =============================================================================
+
+
+class MultiLayerEmbedding(nn.Module):
+    """Encodes a single waypoint coordinate into the language-model embedding space."""
+
+    def __init__(self, input_dim=2, embedding_dim=1536, hidden_dim=512):
+        super().__init__()
+        self.layer1 = nn.Linear(input_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, embedding_dim)
+        self.activation = nn.ReLU()
+
+    def forward(self, coords):
+        if coords.dim() != 3 or coords.size(-1) != 2:
+            raise ValueError(f"Expected coords of shape (B, N, 2), but got {tuple(coords.shape)}")
+        coords = coords.reshape(coords.shape[0], -1)
+        return self.layer2(self.activation(self.layer1(coords)))
+
+
+class HeadBlock(nn.Module):
+    """Post-norm cross-attention block used to build `ActionFormerHead`."""
+
+    def __init__(self, hidden_dim, num_heads):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, q, k, v):
+        attn_out, _ = self.mha(q, k, v)
+        out1 = self.norm1(q + attn_out)
+        return self.norm2(out1 + self.ffn(out1))
+
+
+class ActionFormerHead(nn.Module):
+    """Pools the LM hidden states into a single action conditioning vector."""
+
+    def __init__(self, hidden_dim, num_heads=4, num_blocks=2):
+        super().__init__()
+        self.blocks = nn.ModuleList([HeadBlock(hidden_dim, num_heads) for _ in range(num_blocks)])
+
+    def forward(self, q, k, v):
+        for block in self.blocks:
+            q = block(q, k, v)
+        return q
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Sine/cosine encoding of a batch of flow-matching timesteps.
+
+    Adapted from https://github.com/real-stanford/diffusion_policy.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        if self.dim % 2 != 0:
+            raise ValueError(f"# dimensions must be even but got {self.dim}")
+        half_dim = self.dim // 2
+        exponent = torch.arange(half_dim, device=x.device) * -math.log(10000) / (half_dim - 1)
+        emb = torch.exp(exponent)
+        emb = x[:, None] * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
+class SinusoidalPosEmb(nn.Module):
+    """Timestep encoding used inside `TransformerForDiffusion`."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
+class TransformerForDiffusion(nn.Module):
+    """
+    Transformer velocity field for flow matching, in the diffusion-policy layout:
+    the flow timestep and the VLM observation feature form the encoder memory,
+    while the noisy action chunk is the decoder input.
+
+    Adapted from https://github.com/real-stanford/diffusion_policy.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        horizon: int,
+        n_obs_steps: Optional[int] = None,
+        cond_dim: int = 0,
+        n_layer: int = 12,
+        n_head: int = 12,
+        n_emb: int = 768,
+        p_drop_emb: float = 0.1,
+        p_drop_attn: float = 0.1,
+        causal_attn: bool = False,
+        time_as_cond: bool = True,
+        obs_as_cond: bool = False,
+        n_cond_layers: int = 0,
+    ) -> None:
+        super().__init__()
+
+        # compute number of tokens for main trunk and condition encoder
+        if n_obs_steps is None:
+            n_obs_steps = horizon
+
+        T = horizon
+        T_cond = 1
+        if not time_as_cond:
+            T += 1
+            T_cond -= 1
+        obs_as_cond = cond_dim > 0
+        if obs_as_cond:
+            if not time_as_cond:
+                raise ValueError("`obs_as_cond` requires `time_as_cond=True`")
+            T_cond += n_obs_steps
+
+        # input embedding stem
+        self.input_emb = nn.Linear(input_dim, n_emb)
+        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        self.drop = nn.Dropout(p_drop_emb)
+
+        # condition encoder
+        self.time_emb = SinusoidalPosEmb(n_emb)
+        self.cond_obs_emb = None
+        if obs_as_cond:
+            self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
+
+        self.cond_pos_emb = None
+        self.encoder = None
+        self.decoder = None
+        encoder_only = False
+        if T_cond > 0:
+            self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
+            if n_cond_layers > 0:
+                self.encoder = nn.TransformerEncoder(
+                    encoder_layer=nn.TransformerEncoderLayer(
+                        d_model=n_emb,
+                        nhead=n_head,
+                        dim_feedforward=4 * n_emb,
+                        dropout=p_drop_attn,
+                        activation="gelu",
+                        batch_first=True,
+                        norm_first=True,
+                    ),
+                    num_layers=n_cond_layers,
+                )
+            else:
+                self.encoder = nn.Sequential(
+                    nn.Linear(n_emb, 4 * n_emb),
+                    nn.Mish(),
+                    nn.Linear(4 * n_emb, n_emb),
+                )
+            self.decoder = nn.TransformerDecoder(
+                decoder_layer=nn.TransformerDecoderLayer(
+                    d_model=n_emb,
+                    nhead=n_head,
+                    dim_feedforward=4 * n_emb,
+                    dropout=p_drop_attn,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,  # important for stability
+                ),
+                num_layers=n_layer,
+            )
+        else:
+            # encoder-only (BERT style)
+            encoder_only = True
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer=nn.TransformerEncoderLayer(
+                    d_model=n_emb,
+                    nhead=n_head,
+                    dim_feedforward=4 * n_emb,
+                    dropout=p_drop_attn,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                ),
+                num_layers=n_layer,
+            )
+
+        # attention mask
+        if causal_attn:
+            # torch.nn.Transformer uses an additive mask, so the upper triangle
+            # must be -inf and everything else (including the diagonal) 0.
+            mask = (torch.triu(torch.ones(T, T)) == 1).transpose(0, 1)
+            mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
+            self.register_buffer("mask", mask, persistent=False)
+
+            if time_as_cond and obs_as_cond:
+                t, s = torch.meshgrid(torch.arange(T), torch.arange(T_cond), indexing="ij")
+                # add one dimension since time is the first token in cond
+                memory_mask = t >= (s - 1)
+                memory_mask = (
+                    memory_mask.float().masked_fill(memory_mask == 0, float("-inf")).masked_fill(memory_mask == 1, 0.0)
+                )
+                self.register_buffer("memory_mask", memory_mask, persistent=False)
+            else:
+                self.memory_mask = None
+        else:
+            self.mask = None
+            self.memory_mask = None
+
+        # decoder head
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.head = nn.Linear(n_emb, output_dim)
+
+        # constants
+        self.T = T
+        self.T_cond = T_cond
+        self.horizon = horizon
+        self.time_as_cond = time_as_cond
+        self.obs_as_cond = obs_as_cond
+        self.encoder_only = encoder_only
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.MultiheadAttention):
+            for name in ["in_proj_weight", "q_proj_weight", "k_proj_weight", "v_proj_weight"]:
+                weight = getattr(module, name)
+                if weight is not None:
+                    torch.nn.init.normal_(weight, mean=0.0, std=0.02)
+            for name in ["in_proj_bias", "bias_k", "bias_v"]:
+                bias = getattr(module, name)
+                if bias is not None:
+                    torch.nn.init.zeros_(bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, TransformerForDiffusion):
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            if module.cond_obs_emb is not None:
+                torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        cond: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Args:
+            sample: `(B, T, input_dim)` noisy action chunk.
+            timestep: `(B,)` or scalar flow-matching timestep.
+            cond: `(B, cond_dim)` or `(B, T', cond_dim)` observation conditioning.
+
+        Returns:
+            `(B, T, output_dim)` predicted velocity.
+        """
+        model_dtype = self.input_emb.weight.dtype
+        sample = sample.to(model_dtype)
+        if cond is not None:
+            cond = cond.to(model_dtype)
+
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        # broadcast to batch dimension, in a way that is ONNX/CoreML friendly
+        timesteps = timesteps.expand(sample.shape[0])
+        # the sinusoidal encoding is evaluated in fp32 for numerical stability and
+        # cast back afterwards, so that low-precision training stays well defined
+        time_emb = self.time_emb(timesteps.float()).unsqueeze(1).to(model_dtype)
+        # (B, 1, n_emb)
+
+        input_emb = self.input_emb(sample)
+
+        if self.encoder_only:
+            # BERT style
+            token_embeddings = torch.cat([time_emb, input_emb], dim=1)
+            t = token_embeddings.shape[1]
+            x = self.drop(token_embeddings + self.pos_emb[:, :t, :])
+            x = self.encoder(src=x, mask=self.mask)
+            x = x[:, 1:, :]
+        else:
+            # encoder: [time, observation] -> memory
+            cond_embeddings = time_emb
+            if self.obs_as_cond:
+                cond_obs_emb = self.cond_obs_emb(cond)
+                if cond_obs_emb.dim() == 2:
+                    cond_obs_emb = cond_obs_emb.unsqueeze(1)
+                cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+            tc = cond_embeddings.shape[1]
+            memory = self.encoder(self.drop(cond_embeddings + self.cond_pos_emb[:, :tc, :]))
+            # (B, T_cond, n_emb)
+
+            # decoder: noisy actions attend to the memory
+            t = input_emb.shape[1]
+            x = self.drop(input_emb + self.pos_emb[:, :t, :])
+            x = self.decoder(tgt=x, memory=memory, tgt_mask=self.mask, memory_mask=self.memory_mask)
+            # (B, T, n_emb)
+
+        return self.head(self.ln_f(x))
+
+
+if _ConditionalFlowMatcherBase is not None:
+
+    class ConditionalFlowMatcher(_ConditionalFlowMatcherBase):
+        """
+        Conditional flow matcher with a time-decaying noise schedule.
+
+        `t=0` is pure noise and `t=1` is the ground-truth action, so the
+        interpolation std decays linearly towards the data end of the path.
+        """
+
+        def compute_sigma_t(self, t):
+            return self.sigma * (1 - t)
+
+else:
+    ConditionalFlowMatcher = None
+
+
+class FlowMatchingActionHead(nn.Module):
+    """
+    Flow-matching action head that generates a continuous trajectory chunk by
+    integrating a learned velocity field.
+
+    Based on https://arxiv.org/abs/2409.01083 "Affordance-based Robot
+    Manipulation with Flow Matching".
+    """
+
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=2,
+        action_chunk=5,
+        num_flow_steps=5,
+        sigma=0.0,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.action_chunk = action_chunk
+        self.num_flow_steps = num_flow_steps
+        self.sigma = sigma
+
+        self.velocity_predictor = TransformerForDiffusion(
+            input_dim=action_dim,
+            output_dim=action_dim,
+            horizon=action_chunk,
+            cond_dim=hidden_dim,
+        )
+        self.time_encoder = SinusoidalPositionalEncoding(dim=hidden_dim)
+
+        if ConditionalFlowMatcher is not None:
+            self.flow_matcher = ConditionalFlowMatcher(sigma=sigma)
+        else:
+            self.flow_matcher = None
+            logger.warning_once(
+                "`torchcfm` is not installed, so the flow-matching schedule falls back to a linear path. "
+                "Install it with `pip install torchcfm` to reproduce the SocialNav training recipe."
+            )
+
+    @property
+    def model_dtype(self):
+        return self.velocity_predictor.input_emb.weight.dtype
+
+    @property
+    def model_device(self):
+        return self.velocity_predictor.input_emb.weight.device
+
+    def sample_flow_trajectory(self, ground_truth_actions):
+        """
+        Samples a point along the conditional flow between noise and the
+        ground-truth actions, and returns the corresponding target velocity.
+
+        Args:
+            ground_truth_actions: `(B, action_chunk, action_dim)` normalized actions.
+        """
+        batch_size = ground_truth_actions.shape[0]
+        device = ground_truth_actions.device
+
+        x0 = torch.randn(
+            size=(batch_size, self.action_chunk, self.action_dim),
+            device=device,
+            dtype=ground_truth_actions.dtype,
+        )
+
+        if self.flow_matcher is not None:
+            timestep, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, ground_truth_actions)
+        else:
+            # straight-line path fallback: x_t = (1 - t) * x0 + t * x1, u_t = x1 - x0
+            timestep = torch.rand(batch_size, device=device, dtype=ground_truth_actions.dtype)
+            t = timestep.view(-1, 1, 1)
+            xt = (1 - t) * x0 + t * ground_truth_actions
+            ut = ground_truth_actions - x0
+
+        flow_timestep_embeddings = self.time_encoder(timestep).to(xt.dtype).to(xt.device).unsqueeze(1)
+
+        return {
+            "noise": ut,  # target velocity field
+            "noisy_actions": xt,  # current point along the path
+            "flow_timestep_embeddings": flow_timestep_embeddings,
+            "timestep": timestep,
+        }
+
+    def predict_velocity(self, obs_cond, xt, timestep=None):
+        """
+        Predicts the velocity field given the VLM observation conditioning.
+
+        Args:
+            obs_cond: `(B, hidden_dim)` action feature pooled from the LM hidden states.
+            xt: `(B, action_chunk, action_dim)` current point along the flow path.
+            timestep: `(B,)` flow-matching timestep.
+        """
+        model_dtype = self.velocity_predictor.input_emb.weight.dtype
+        obs_cond = obs_cond.to(model_dtype)
+        xt = xt.to(model_dtype)
+        if timestep is not None:
+            timestep = timestep.float()
+        return self.velocity_predictor(xt, timestep, obs_cond)
+
+    def generate_actions(self, obs_conditioning, num_steps=None):
+        """
+        Integrates the velocity field from noise to an action chunk (Euler ODE).
+
+        Args:
+            obs_conditioning: `(B, hidden_dim)` observation conditioning.
+            num_steps: number of Euler steps, defaults to `self.num_flow_steps`.
+        """
+        if num_steps is None:
+            num_steps = self.num_flow_steps
+
+        batch_size = obs_conditioning.shape[0]
+        device = obs_conditioning.device
+        trajectory = torch.randn(
+            batch_size, self.action_chunk, self.action_dim, device=device, dtype=self.model_dtype
+        )
+
+        for i in range(num_steps):
+            timestep = torch.tensor([i / num_steps], device=device).expand(batch_size)
+            velocity_pred = self.predict_velocity(obs_conditioning, trajectory, timestep)
+            trajectory = trajectory + velocity_pred * (1.0 / num_steps)
+
+        return trajectory
+
+
 class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {
         "^visual": "model.visual",
@@ -1364,12 +1839,167 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        action_dim: int = 2,
+        action_chunk: int = 5,
+        flow_matching_policy: bool = True,
+        num_flow_steps: int = 5,
+        action_former: bool = False,
+        query_action_layer: int = 4,
+        sigma: float = 0.0,
+        ar_lambda_loss: float = 1.0,
+        sde_mode: str = "cps",
+        noise_level: float = 0.0,
+        add_noise_step_num: Optional[int] = None,
+        min_value: float = -1.25,
+        max_value: float = 1.25,
+        **kwargs,
+    ):
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
+        # --- SocialNav action expert ---
+        self.action_dim = action_dim
+        self.action_chunk = action_chunk
+        self.flow_matching_policy = flow_matching_policy
+        self.num_flow_steps = num_flow_steps
+        self.ar_lambda_loss = ar_lambda_loss
+        self.sde_mode = sde_mode
+        self.noise_level = noise_level
+        self.add_noise_step_num = add_noise_step_num
+        self.action_former = action_former
+        self.query_action_layer = query_action_layer
+
+        # Per-step bounds used to map physical deltas to [-1, 1]. Registered as
+        # non-persistent buffers: they follow the module across devices but are
+        # derived from the training configuration rather than learned, so they
+        # stay out of the checkpoint.
+        self.register_buffer(
+            "action_min",
+            torch.full((1, action_chunk, action_dim), float(min_value)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_max",
+            torch.full((1, action_chunk, action_dim), float(max_value)),
+            persistent=False,
+        )
+
+        if self.flow_matching_policy:
+            hidden_size = config.text_config.hidden_size
+            self.flow_matching_model = FlowMatchingActionHead(
+                input_dim=hidden_size,
+                hidden_dim=hidden_size,
+                action_dim=self.action_dim,
+                action_chunk=self.action_chunk,
+                num_flow_steps=self.num_flow_steps,
+                sigma=sigma,
+            )
+            self.input_wp_encoder = MultiLayerEmbedding(embedding_dim=hidden_size)
+
+            if self.action_former:
+                if self.query_action_layer == 1:
+                    self.query_multihead_attn = nn.MultiheadAttention(
+                        embed_dim=hidden_size,
+                        num_heads=4,
+                        batch_first=True,
+                    )
+                else:
+                    self.query_multihead_multi_attn = ActionFormerHead(
+                        hidden_dim=hidden_size,
+                        num_heads=4,
+                        num_blocks=self.query_action_layer,
+                    )
+                self.query_action = nn.Parameter(torch.zeros(1, 1, hidden_size))
+
+        self.rope_deltas = None
         self.post_init()
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        # `query_action` is a bare parameter owned by this class, so the generic
+        # module-based initialization never reaches it.
+        query_action = getattr(self, "query_action", None)
+        if module is self and query_action is not None and not query_action.is_meta:
+            std = getattr(self.config.text_config, "initializer_range", 0.02)
+            query_action.data.normal_(mean=0.0, std=std)
+
+    def normalize_actions(self, actions):
+        """Maps physical per-step deltas into the `[-1, 1]` training range."""
+        min_val = self.action_min.to(device=actions.device, dtype=actions.dtype)
+        max_val = self.action_max.to(device=actions.device, dtype=actions.dtype)
+        normalized = (actions - min_val) / (max_val - min_val + 1e-8)
+        return normalized * 2 - 1
+
+    def denormalize_actions(self, norm_actions):
+        """Inverse of `normalize_actions`."""
+        min_val = self.action_min.to(device=norm_actions.device, dtype=norm_actions.dtype)
+        max_val = self.action_max.to(device=norm_actions.device, dtype=norm_actions.dtype)
+        return (norm_actions + 1) / 2 * (max_val - min_val) + min_val
+
+    def recover_waypoints_from_pred(self, pred_actions):
+        """
+        Turns normalized per-step deltas into absolute waypoints.
+
+        Args:
+            pred_actions: `(B, action_chunk, action_dim)` predictions in `[-1, 1]`.
+
+        Returns:
+            `(B, action_chunk, 2)` waypoints in the ego frame.
+        """
+        if pred_actions.dim() == 2:
+            pred_actions = pred_actions.unsqueeze(0)
+        pred_delta = self.denormalize_actions(pred_actions)
+        return torch.cumsum(pred_delta, dim=1)[:, :, :2]
+
+    def _encode_input_waypoints(self, input_ids, inputs_embeds, input_waypoints):
+        """
+        Replaces the `<input_pos*>` placeholder embeddings with the encoded
+        history waypoints. Returns `inputs_embeds` unchanged when the model was
+        not given any waypoint to inject.
+        """
+        start_id = getattr(self, "special_token2id", None)
+        if start_id and "<input_pos1>" in start_id:
+            start_id = start_id["<input_pos1>"]
+        else:
+            start_id = 151657
+
+        if input_waypoints.dim() == 2:
+            input_waypoints = input_waypoints.unsqueeze(0)
+        if input_waypoints.dim() != 3:
+            raise ValueError(f"`input_waypoints` must be 2D or 3D, got {tuple(input_waypoints.shape)}")
+
+        wp_dtype = self.input_wp_encoder.layer1.weight.dtype
+        for offset in range(input_waypoints.shape[1]):
+            token_mask = input_ids == (start_id + offset)
+            if not token_mask.any():
+                continue
+            cur_wp = input_waypoints[:, offset, :].unsqueeze(1).to(wp_dtype)
+            wp_emb = self.input_wp_encoder(cur_wp).to(inputs_embeds.dtype)
+            token_mask = token_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(token_mask, wp_emb)
+        return inputs_embeds
+
+    def _pool_action_feature(self, hidden_states):
+        """
+        Pools the LM hidden states into the action conditioning vector.
+
+        The hidden states are cast to the action expert's dtype, so that a
+        backbone kept in lower precision can be combined with a higher
+        precision action expert.
+        """
+        if self.action_former:
+            hidden_states = hidden_states.to(self.query_action.dtype)
+            query_action = self.query_action.expand(hidden_states.shape[0], -1, -1)
+            if self.query_action_layer == 1:
+                action_feature, _ = self.query_multihead_attn(query_action, hidden_states, hidden_states)
+            else:
+                action_feature = self.query_multihead_multi_attn(query_action, hidden_states, hidden_states)
+            return action_feature.squeeze(1)
+        return hidden_states[:, -1, :]
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -1421,6 +2051,18 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        # === SocialNav: flow-matching action expert ===
+        gt_waypoints: Optional[torch.Tensor] = None,
+        input_waypoints: Optional[torch.Tensor] = None,
+        arrive: Optional[torch.Tensor] = None,
+        train: bool = True,
+        train_branch: str = "fm",
+        special_token2id: Optional[dict[str, int]] = None,
+        grpo_mode: Optional[bool] = False,
+        next_sampled_actions_list=None,
+        sampled_actions_list=None,
+        select_noise: Optional[torch.Tensor] = None,
+        num_samples: int = 1,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -1436,6 +2078,30 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             The rope index difference between sequence length and multimodal rope.
         second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+        gt_waypoints (`torch.Tensor` of shape `(batch_size, action_chunk, 2)`, *optional*):
+            Ground-truth absolute waypoints supervising the flow-matching branch.
+        input_waypoints (`torch.Tensor` of shape `(batch_size, num_history, 2)`, *optional*):
+            History waypoints injected at the `<input_pos*>` placeholder tokens.
+        arrive (`torch.Tensor` of shape `(batch_size,)`, *optional*):
+            Arrival flag of each sample, kept for dataset compatibility.
+        train (`bool`, *optional*, defaults to `True`):
+            When `False` the action expert samples a trajectory instead of computing a loss.
+        train_branch (`str`, *optional*, defaults to `"fm"`):
+            `"fm"` trains the flow-matching action expert, `"ar"` the language head.
+        special_token2id (`dict[str, int]`, *optional*):
+            Maps SocialNav placeholder tokens to their ids; `<input_pos1>` locates the waypoint slots.
+        grpo_mode (`bool`, *optional*):
+            When set, the action chunk is sampled with an SDE solver and the
+            per-step log-probabilities are returned for SAFE-GRPO.
+        next_sampled_actions_list (`list[torch.Tensor]`, *optional*):
+            Trajectory points reached after each SDE step, used to re-score old samples in SAFE-GRPO.
+        sampled_actions_list (`list[torch.Tensor]`, *optional*):
+            Trajectory points visited by a previous rollout, used to re-score old samples in SAFE-GRPO.
+        select_noise (`torch.Tensor` of shape `(batch_size, action_chunk, action_dim)`, *optional*):
+            Fixed initial noise, so that a rollout can be reproduced exactly.
+        num_samples (`int`, *optional*, defaults to 1):
+            Number of trajectories to draw per sample at inference time. The returned
+            waypoints are then shaped `(batch_size * num_samples, action_chunk, 2)`.
 
         Example:
 
@@ -1473,6 +2139,26 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # The collator may hand over one `train_branch` entry per sample; the
+        # whole batch is required to take the same branch.
+        if isinstance(train_branch, (list, tuple)):
+            if len(set(train_branch)) > 1:
+                raise ValueError(f"Mixed `train_branch` values in one batch: {train_branch}")
+            train_branch = train_branch[0] if train_branch else "fm"
+        if not train_branch:
+            train_branch = "fm"
+
+        if special_token2id is not None:
+            self.special_token2id = special_token2id
+
+        # History waypoints are injected before the backbone runs, so the text
+        # embeddings have to be materialized here. Vision embeddings and the
+        # multimodal RoPE index stay the responsibility of `self.model`.
+        if input_waypoints is not None and input_ids is not None and getattr(self, "input_wp_encoder", None) is not None:
+            if inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
+            inputs_embeds = self._encode_input_waypoints(input_ids, inputs_embeds, input_waypoints)
+
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1482,9 +2168,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             second_per_grid_ts=second_per_grid_ts,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=None if grpo_mode else past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            use_cache=False if grpo_mode else use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,
@@ -1493,7 +2179,85 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
 
         hidden_states = outputs[0]
+        self.rope_deltas = outputs.rope_deltas
 
+        # --- Branch A: flow-matching action expert -------------------------------
+        # Falls through to the language head when no trajectory is involved, so
+        # that text-only samples keep working inside the same batch schedule.
+        if self.flow_matching_policy and train_branch == "fm" and (gt_waypoints is not None or not train):
+            # The action expert may be held at a different precision than the
+            # backbone, so every tensor below follows the expert's own dtype.
+            expert_dtype = self.flow_matching_model.model_dtype
+            action_feature = self._pool_action_feature(hidden_states).to(expert_dtype)
+            device = hidden_states.device
+            batch_size = hidden_states.shape[0]
+
+            if not train:
+                # Draw several trajectories per sample when asked to; the action
+                # conditioning is replicated so that samples stay grouped per input.
+                num_samples = max(int(num_samples), 1)
+                if num_samples > 1:
+                    action_feature = action_feature.repeat_interleave(num_samples, dim=0)
+                    batch_size = action_feature.shape[0]
+
+                if select_noise is not None:
+                    curr_flow_trajectory = select_noise.to(device=device, dtype=expert_dtype)
+                else:
+                    curr_flow_trajectory = torch.randn(
+                        batch_size,
+                        self.action_chunk,
+                        self.action_dim,
+                        device=device,
+                        dtype=expert_dtype,
+                    )
+
+                if grpo_mode:
+                    return self._grpo_sample_actions(
+                        action_feature=action_feature,
+                        curr_flow_trajectory=curr_flow_trajectory,
+                        sampled_actions_list=sampled_actions_list,
+                        next_sampled_actions_list=next_sampled_actions_list,
+                    )
+
+                # Plain inference: Euler integration of the velocity field.
+                with torch.no_grad():
+                    for step in range(self.num_flow_steps):
+                        timestep = torch.tensor([step / self.num_flow_steps], device=device)
+                        velocity_pred = self.flow_matching_model.predict_velocity(
+                            action_feature, curr_flow_trajectory, timestep
+                        )
+                        curr_flow_trajectory = curr_flow_trajectory + velocity_pred * (1.0 / self.num_flow_steps)
+                        curr_flow_trajectory = curr_flow_trajectory.to(expert_dtype)
+
+                pred_waypoints = self.recover_waypoints_from_pred(curr_flow_trajectory)
+                arrive_pred = torch.zeros(batch_size, device=device)
+                return pred_waypoints, arrive_pred
+
+            # Training: regress the conditional flow-matching velocity field.
+            delta_waypoints = torch.zeros_like(gt_waypoints)
+            delta_waypoints[:, 0] = gt_waypoints[:, 0]
+            delta_waypoints[:, 1:] = gt_waypoints[:, 1:] - gt_waypoints[:, :-1]
+            normalized_target = self.normalize_actions(delta_waypoints).to(expert_dtype)
+
+            flow_dict = self.flow_matching_model.sample_flow_trajectory(normalized_target)
+            velocity_target = flow_dict["noise"].to(expert_dtype)
+            noisy_actions = flow_dict["noisy_actions"].to(expert_dtype)
+            timestep = flow_dict["timestep"].to(expert_dtype)
+
+            velocity_pred = self.flow_matching_model.predict_velocity(action_feature, noisy_actions, timestep)
+            velocity_pred = velocity_pred.reshape(velocity_target.shape)
+            loss = nn.functional.mse_loss(velocity_pred, velocity_target, reduction="mean")
+
+            return Qwen2_5_VLCausalLMOutputWithPast(
+                loss=loss,
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                rope_deltas=outputs.rope_deltas,
+            )
+
+        # --- Branch B: auto-regressive language head -----------------------------
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -1503,6 +2267,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             loss = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
+            loss = self.ar_lambda_loss * loss
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
@@ -1511,6 +2276,86 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+        )
+
+    def _grpo_sample_actions(
+        self,
+        action_feature,
+        curr_flow_trajectory,
+        sampled_actions_list=None,
+        next_sampled_actions_list=None,
+    ):
+        """
+        Samples an action chunk with an SDE solver, keeping the per-step
+        log-probabilities required by SAFE-GRPO.
+
+        Returns:
+            `(pred_waypoints, timesteps, actions_list, log_probs, means, stds, initial_noise)`
+        """
+        # Imported lazily: the SDE schedules live in the training package, which
+        # must not become an import-time dependency of `transformers`.
+        from src.train.sde_with_logprob import (
+            ConditionalFlowMatcherWithSigmaSchedule,
+            ConditionalFlowMatcherWithSigmaSchedule_CPS,
+        )
+
+        device = curr_flow_trajectory.device
+        dtype = curr_flow_trajectory.dtype
+        batch_size = curr_flow_trajectory.shape[0]
+        initial_noise = curr_flow_trajectory.clone()
+
+        if not hasattr(self, "sde_scheduler"):
+            scheduler_cls = (
+                ConditionalFlowMatcherWithSigmaSchedule_CPS
+                if self.sde_mode == "cps"
+                else ConditionalFlowMatcherWithSigmaSchedule
+            )
+            self.sde_scheduler = scheduler_cls(
+                num_inference_steps=self.num_flow_steps,
+                noise_level=self.noise_level,
+                device=device,
+            )
+
+        actions_list = [curr_flow_trajectory]
+        all_log_probs, all_sample_mean, all_std = [], [], []
+
+        for i, timestep in enumerate(self.sde_scheduler.timesteps[:-1]):
+            ts = timestep.to(device).unsqueeze(0)
+            velocity_pred = self.flow_matching_model.predict_velocity(action_feature, curr_flow_trajectory, 1 - ts)
+
+            if self.add_noise_step_num is not None and i >= self.add_noise_step_num:
+                # Deterministic ODE tail: no extra noise, hence zero log-prob.
+                new_traj = curr_flow_trajectory + velocity_pred * (1.0 / self.num_flow_steps)
+                log_prob = torch.zeros(batch_size, device=device, dtype=velocity_pred.dtype)
+                mean = new_traj
+                std = torch.zeros_like(new_traj)
+            elif sampled_actions_list is None:
+                new_traj, log_prob, mean, std = self.sde_scheduler.sde_step_with_logprob(
+                    v_t=velocity_pred, timestep=ts, x_t=curr_flow_trajectory
+                )
+            else:
+                new_traj, log_prob, mean, std = self.sde_scheduler.sde_step_with_logprob(
+                    v_t=velocity_pred,
+                    timestep=ts,
+                    x_t=sampled_actions_list[i],
+                    x_t_new=next_sampled_actions_list[i],
+                )
+
+            curr_flow_trajectory = new_traj.to(dtype)
+            actions_list.append(new_traj)
+            all_log_probs.append(log_prob)
+            all_sample_mean.append(mean)
+            all_std.append(std)
+
+        pred_waypoints = self.recover_waypoints_from_pred(curr_flow_trajectory)
+        return (
+            pred_waypoints,
+            self.sde_scheduler.timesteps,
+            actions_list,
+            all_log_probs,
+            all_sample_mean,
+            all_std,
+            initial_noise,
         )
 
     def prepare_inputs_for_generation(

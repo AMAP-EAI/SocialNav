@@ -305,33 +305,24 @@ def train():
             model_args.model_id,
             dtype=compute_dtype,
             attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
+            **bnb_model_from_pretrained_args,
+            **additional_model_kwargs
         )
 
-    if 'Instruct' not in model_args.model_id:
-        print('!!!loading my own model.safetensors...')
-        try:
-            safe_model_path = os.path.join(model_args.model_id,'model.safetensors')
-            from safetensors.torch import load_file
-            state_dict = load_file(safe_model_path)
-            model.load_state_dict(state_dict,strict=False)
-        except:
-            from safetensors.torch import load_file
-            safe_model_path = os.path.join(model_args.model_id,'model-00001-of-00002.safetensors')
-            state_dict = load_file(safe_model_path)
-            model.load_state_dict(state_dict,strict=False)
-            safe_model_path = os.path.join(model_args.model_id,'model-00002-of-00002.safetensors')
-            state_dict = load_file(safe_model_path)
-            model.load_state_dict(state_dict,strict=False)
-        print('model.safetensors loaded!')
-        
-    else:
+    elif config.model_type == "qwen2_vl":
         replace_qwen_2_with_mixed_modality_forward()
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_args.model_id,
             dtype=compute_dtype,
             attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
+            **bnb_model_from_pretrained_args,
+            **additional_model_kwargs
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported model_type '{config.model_type}'. Expected one of: "
+            "qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe."
         )
 
     model.config.use_cache = False
